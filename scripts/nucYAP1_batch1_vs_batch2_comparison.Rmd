@@ -1,0 +1,385 @@
+---
+title: "Batch 1 vs batch 2: YAP1C sulfenome findings"
+author: "Analysis notebook"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Paths below are relative to the project root, so knit from there rather than
+# from this file's folder in scripts/.
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+library(dplyr)
+
+# rd(1, "file.csv") reads a table written by the batch 1 notebook, and so on.
+rd <- function(batch, file) {
+  readr::read_csv(file.path(paste0("output_batch", batch), "results", file),
+                  show_col_types = FALSE, progress = FALSE)
+}
+
+# Where this document's own tables go.
+outdir <- "output_comparison"
+```
+
+# Batch 1 vs batch 2: YAP1C sulfenome findings
+
+Comparison of [nucYAP1_batch1_analysis.Rmd](nucYAP1_batch1_analysis.Rmd) and
+[nucYAP1_batch2_analysis.Rmd](nucYAP1_batch2_analysis.Rmd), from their written
+outputs (`output_batch1/results`, `output_batch2/results`).
+
+## Design difference
+
+| | batch 1 | batch 2 |
+|---|---|---|
+| Runs | 16 (4 per group) | 12 (3 per group) |
+| Reproducibility rule | 3 of 4 | 2 of 3 |
+| Min possible Fisher p (3 vs 3) | 0.029 | 0.10 |
+
+```{r design-check}
+# The batch 2 sample sheet sets the floor on any 3-vs-3 detection test.
+fisher.test(matrix(c(3, 0, 0, 3), nrow = 2))$p.value
+```
+
+## Global protein-group identifications
+
+Before any interactor logic, how much of the proteome does each batch see, and
+do the two probes see the same proteins? These counts come straight from the
+DIA-NN report with the notebooks' own filter (target precursors at q <= 0.01 and
+PG q <= 0.01 with a positive quantity), so a protein group counts as identified
+in a run if it has at least one such precursor there. No replicate minimum is
+applied — this is the raw observability behind the analysis.
+
+```{r global-identifications}
+# Per-run protein-group lists, one row per run x identified group.
+pg_per_run <- function(batch) {
+  base <- file.path("data", paste0("HL_nucYAP1_batch", batch), "DIA-NN_output")
+  design <- readr::read_tsv(file.path(base, "experiment_design.tsv"), show_col_types = FALSE)
+  arrow::read_parquet(file.path(base, "report.parquet"),
+                      col_select = c("Run", "Protein.Group", "Q.Value",
+                                     "PG.Q.Value", "Precursor.Quantity", "Decoy")) |>
+    filter(Decoy == 0, Q.Value <= 0.01, PG.Q.Value <= 0.01, Precursor.Quantity > 0) |>
+    distinct(Run, Protein.Group) |>
+    inner_join(design, by = "Run") |>
+    mutate(batch = batch)
+}
+
+pg_run <- bind_rows(pg_per_run(1), pg_per_run(2))
+
+# Identifications per individual run: the spread within a batch is QC.
+pg_run |>
+  count(batch, Run) |>
+  summarise(runs = n(), min = min(n), median = median(n), max = max(n), .by = batch)
+```
+
+Both probes see roughly the same number of protein groups within a batch, and
+almost all of them are shared:
+
+| Batch | YAP1A only | YAP1C only | Both probes | Union |
+|---|---|---|---|---|
+| 1 | 137 | 635 | 4418 | 5190 |
+| 2 | 169 | 165 | 1583 | 1917 |
+
+```{r genotype-overlap}
+genotype_counts <- function(batch) {
+  d  <- filter(pg_run, batch == batch)
+  ya <- unique(d$Protein.Group[d$Genotype == "YA"])
+  yc <- unique(d$Protein.Group[d$Genotype == "YC"])
+  tibble(batch = paste("batch", batch),
+         YA_only = length(setdiff(ya, yc)),
+         YC_only = length(setdiff(yc, ya)),
+         both = length(intersect(ya, yc)),
+         union = length(union(ya, yc)))
+}
+genotype_counts(1) |> bind_rows(genotype_counts(2))
+```
+
+The two batches overlap by less than a third of their combined lists, and the
+difference is depth rather than identity of the proteins:
+
+| | Batch 1 only | In both batches | Batch 2 only |
+|---|---|---|---|
+| Protein groups | 3573 | 1617 | 300 |
+
+```{r batch-overlap}
+u1 <- unique(pg_run$Protein.Group[pg_run$batch == 1])
+u2 <- unique(pg_run$Protein.Group[pg_run$batch == 2])
+tibble(batch1_only = length(setdiff(u1, u2)),
+       in_both     = length(intersect(u1, u2)),
+       batch2_only = length(setdiff(u2, u1)))
+```
+
+Reproduction across runs is the same shape in both batches, shifted by about
+1500 groups:
+
+| Protein groups seen in ... runs | batch 1 (16 runs) | batch 2 (12 runs) |
+|---|---|---|
+| 1-3 runs (sporadic) | 742 | 484 |
+| 4-8 runs | 869 | 413 |
+| 9-12 runs | 683 | 1020 |
+| 13-16 runs | 2896 | 0 |
+
+```{r replication}
+pg_run |>
+  count(batch, Protein.Group) |>
+  mutate(seen = cut(n, breaks = c(0, 3, 8, 12, 16), labels = c("1-3", "4-8", "9-12", "13-16"))) |>
+  count(batch, seen) |>
+  tidyr::pivot_wider(names_from = batch, values_from = n, values_fill = 0)
+```
+
+Two things follow for the rest of the comparison. Batch 1 is roughly 2.7x deeper
+per run (2816-4304 groups vs 1013-1436 in batch 2), which is more than a
+4-vs-3 replicate difference; and the batches share only 1617 protein groups, so
+a protein that is "batch 1 only" may simply not be observable in batch 2 rather
+than being absent from the sample.
+
+## Scale of the results
+
+| Step | batch 1 | batch 2 |
+|---|---|---|
+| YAP1C interactors (Step 1) | 3624 | 1237 |
+| Route A: absent from YAP1A | 184 | 61 |
+| Route B: enriched over YAP1A | 38 | 10 |
+| Specific interactor set | 222 | 71 |
+| Proteins quantified in both treatments | 99 | 26 |
+| Detection-only proteins | 123 | 45 |
+
+```{r counts}
+n_counts <- function(batch) {
+  c(interactors        = nrow(rd(batch, "YAP1C_all_interactors.csv")),
+    route_a            = nrow(rd(batch, "unique_YAP1C_interactors.csv")),
+    route_b            = nrow(rd(batch, "YAP1C_enriched_significant.csv")),
+    specific           = nrow(rd(batch, "YAP1C_specific_interactors_broadened.csv")),
+    both_arms          = sum(rd(batch, "YAP1C_NL_vs_HL_test_coverage.csv")$tested_in == "both arms"),
+    detection_only     = sum(rd(batch, "YAP1C_NL_vs_HL_test_coverage.csv")$tested_in == "detection only"))
+}
+rbind(batch1 = n_counts(1), batch2 = n_counts(2))
+```
+
+Route B is narrow in both: 1053 of 3212 proteins pass the YAP1C-vs-YAP1A test at
+adj. p < 0.05 in batch 1 (115 of 1264 in batch 2), but only 38 (batch 2: 10) also
+clear the fold-change and specificity filters.
+
+```{r route-b}
+route_b_tested <- function(batch) {
+  e <- rd(batch, "YAP1C_vs_YAP1A_limma.csv")
+  c(tested = nrow(e), sig = sum(e$adj_pvalue < 0.05, na.rm = TRUE))
+}
+rbind(batch1 = route_b_tested(1), batch2 = route_b_tested(2))
+```
+
+## High light vs normal light
+
+Neither batch found a single protein whose **intensity** changed with
+treatment (limma, adj. p < 0.05): 0 of 99 testable in batch 1, 0 of 26 in
+batch 2. No protein passed the Fisher **detection** test either, and in batch 2
+none could (smallest attainable p = 0.10 with 3 vs 3 replicates).
+
+```{r hl-nl-tests}
+for (b in 1:2) {
+  d  <- rd(b, "YAP1C_NL_vs_HL_differential.csv")
+  pa <- rd(b, "YAP1C_NL_vs_HL_presence_absence.csv")
+  cat(sprintf("batch %d: intensity %d/%d significant at adj.p < 0.05; detection %d/%d; min raw p = %.3f\n",
+              b, sum(d$adj_pvalue < 0.05, na.rm = TRUE), nrow(d),
+              sum(pa$fisher_adj < 0.05, na.rm = TRUE), nrow(pa),
+              min(pa$fisher_p, na.rm = TRUE)))
+}
+```
+
+So every treatment verdict is descriptive, coming from detection patterns
+(HL-only / NL-only / both) rather than from a hypothesis test:
+
+| Verdict | batch 1 | batch 2 |
+|---|---|---|
+| HL-leaning (detection) | 28 | 33 |
+| NL-leaning (detection) | 3 | 4 |
+| No clear NL/HL difference | 191 | 34 |
+
+```{r verdicts}
+n_verdicts <- function(batch) {
+  v <- rd(batch, "YAP1C_NL_vs_HL_combined_verdict.csv")
+  tibble(verdict = c("HL-leaning (detection)", "NL-leaning (detection)",
+                     "no clear NL/HL difference"),
+         n = as.integer(table(factor(v$verdict, levels = verdict))[verdict]))
+}
+left_join(mutate(n_verdicts(1), batch1 = n) |> select(-n),
+          mutate(n_verdicts(2), batch2 = n) |> select(-n), by = "verdict")
+```
+
+Batch 2 looks more treatment-responsive (37 of 71 proteins vs 31 of 222), but
+with 3 replicates its detection patterns are easier to produce by chance --- an
+HL-exclusive call needs only 2/3 vs 0/3. The two batches are not comparable on
+this axis.
+
+All 38 batch-1 route B proteins and all 10 batch-2 route B proteins fell in "no
+clear difference": they entered the comparison through enrichment over the
+control, and nothing about them changed between treatments.
+
+## Treatment-specific interactors
+
+The detection arm splits the specific interactors by which treatment they were
+seen in:
+
+- **exclusive** --- reproducible in one treatment, absent from the other
+  (`HL-exclusive`, `NL-exclusive`);
+- **biased** --- seen in both, but in fewer replicates in one (`HL-biased`,
+  `NL-biased`);
+- **both treatments** --- equally reproducible in the two.
+
+| Pattern | batch 1 (of 222) | batch 2 (of 71) |
+|---|---|---|
+| HL-exclusive | 28 | 33 |
+| HL-biased | 77 | 7 |
+| both treatments | 99 | 26 |
+| NL-biased | 15 | 1 |
+| NL-exclusive | 3 | 4 |
+
+```{r treatment-specific}
+n_pattern <- function(batch) {
+  pa <- rd(batch, "YAP1C_NL_vs_HL_presence_absence.csv")
+  lv <- c("HL-exclusive", "HL-biased", "both treatments", "NL-biased", "NL-exclusive")
+  as.integer(table(factor(pa$pattern, levels = lv))[lv])
+}
+lvl <- c("HL-exclusive", "HL-biased", "both treatments", "NL-biased", "NL-exclusive")
+tibble(pattern = lvl, batch1 = n_pattern(1), batch2 = n_pattern(2))
+```
+
+Both batches put a clear majority of treatment-specific proteins on the
+high-light side: 28 vs 3 exclusive proteins in batch 1, 33 vs 4 in batch 2, and
+the same direction for the biased proteins (77 vs 15, 7 vs 1). Batch 1's
+exclusive calls are also stronger within a group: 23 of its 28 HL-exclusive
+proteins were seen 3/4 and 5 were 4/4, whereas batch 2's are 23 at 2/3 and 10 at
+3/3.
+
+```{r exclusive-strength}
+for (b in 1:2) {
+  pa <- rd(b, "YAP1C_NL_vs_HL_presence_absence.csv")
+  ex <- filter(pa, pattern %in% c("HL-exclusive", "NL-exclusive"))
+  cat(sprintf("batch %d: %d exclusive proteins, replicate counts HL/NL:\n", b, nrow(ex)))
+  print(table(HL = ex$det_HL, NL = ex$det_NL))
+}
+```
+
+**The two batches share no exclusive protein at all** (0 HL-exclusive and 0
+NL-exclusive in common), so there is no overlap to check agreement on. That,
+plus a roughly threefold difference in the size of the specific set, means the
+treatment-specific lists should be treated as batch-specific observations.
+
+```{r exclusive-overlap}
+ex_of <- function(batch) {
+  pa <- rd(batch, "YAP1C_NL_vs_HL_presence_absence.csv")
+  list(HL = pa$Protein.Group[pa$pattern == "HL-exclusive"],
+       NL = pa$Protein.Group[pa$pattern == "NL-exclusive"])
+}
+e1 <- ex_of(1); e2 <- ex_of(2)
+c(HL_exclusive_shared = length(intersect(e1$HL, e2$HL)),
+  NL_exclusive_shared = length(intersect(e1$NL, e2$NL)))
+```
+
+Batch 2 looks about three times more treatment-specific (37 of 71 proteins,
+52%) than batch 1 (31 of 222, 14%). That difference is best explained by the
+rep 2/3 rule, not by biology: a 2/3 vs 0/3 pattern is easy to produce from
+sampling, and with 3 replicates the detection test cannot reach significance
+(minimum p = 0.10), so none of these calls is statistically supported in batch
+2. Batch 1's 4/4-only exclusives are the strongest candidates on offer.
+
+## Do the two batches agree?
+
+Only 11 proteins are in both specific sets (211 batch-1 only, 60 batch-2 only),
+so overlap cannot be assessed at scale.
+
+```{r overlap}
+s1 <- rd(1, "YAP1C_specific_interactors_broadened.csv")
+s2 <- rd(2, "YAP1C_specific_interactors_broadened.csv")
+cat("shared:", length(intersect(s1$Protein.Group, s2$Protein.Group)),
+    "| batch 1 only:", length(setdiff(s1$Protein.Group, s2$Protein.Group)),
+    "| batch 2 only:", length(setdiff(s2$Protein.Group, s1$Protein.Group)), "\n")
+```
+
+Among those 11:
+
+- 8 agree on "no clear NL/HL difference"
+- 2 are HL-leaning in batch 2 but not in batch 1
+- 1 is HL-leaning in batch 1 (SAMC1) but not in batch 2
+
+```{r verdict-agreement}
+v1 <- rd(1, "YAP1C_NL_vs_HL_combined_verdict.csv")
+v2 <- rd(2, "YAP1C_NL_vs_HL_combined_verdict.csv")
+j <- inner_join(rename(v1, verdict1 = verdict) |> select(Protein.Group, Genes, verdict1),
+                rename(v2, verdict2 = verdict) |> select(Protein.Group, verdict2),
+                by = "Protein.Group")
+print(table(j$verdict1, j$verdict2))
+filter(j, verdict1 != verdict2)
+```
+
+The small overlap is the main caveat. Batch 1 identified 3624 interactors and
+batch 2 1237, which is a much larger difference than a 4-vs-3 replicate change
+would explain, so the two runs likely differ in depth or sample quality as well
+as in size.
+
+## Shared interactors: written to a file
+
+The overlap is small enough to be worth reading protein by protein, so it is
+written out alongside the batch results. One row per protein group that is a
+specific interactor in **both** batches, with each batch's own columns kept
+side by side (`_b1` and `_b2` suffixes) so nothing is merged or reinterpreted.
+
+```{r shared-interactors}
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+v1 <- rd(1, "YAP1C_NL_vs_HL_combined_verdict.csv")
+v2 <- rd(2, "YAP1C_NL_vs_HL_combined_verdict.csv")
+
+keep <- c("Protein.Group", "Genes", "Protein.Names", "Description", "route",
+          "qualifies_in", "tested_in", "det_HL", "det_NL", "pattern",
+          "detection_class", "log2FC_HL_vs_NL", "adj_pvalue", "fisher_p", "verdict")
+
+shared <- inner_join(
+  select(v1, all_of(keep)) |> rename_with(~ paste0(.x, "_b1"), -Protein.Group),
+  select(v2, all_of(keep)) |> rename_with(~ paste0(.x, "_b2"), -Protein.Group),
+  by = "Protein.Group") |>
+  # one label per protein, preferring whichever batch mapped a gene symbol
+  mutate(Genes = coalesce(Genes_b1, Genes_b2),
+         verdict_agrees = verdict_b1 == verdict_b2) |>
+  relocate(Genes, verdict_agrees, .after = Protein.Group) |>
+  arrange(desc(verdict_agrees), Genes)
+
+readr::write_csv(shared, file.path(outdir, "YAP1C_specific_interactors_shared_batch1_batch2.csv"))
+
+cat("Shared specific interactors:", nrow(shared), "of",
+    nrow(v1), "(batch 1) and", nrow(v2), "(batch 2)\n")
+cat("Written to", file.path(outdir, "YAP1C_specific_interactors_shared_batch1_batch2.csv"), "\n")
+shared
+```
+
+`verdict_agrees` is TRUE where both batches gave the protein the same treatment
+verdict. A protein can be shared and still disagree, and those rows are the ones
+worth looking at by hand.
+
+## Known gaps in batch 2
+
+- The Ensembl peptide-ID lookup returned no mappings, so protein groups fell back
+  to UniProt accessions and `uniprot_to_ensembl_peptide.csv` was not written.
+- Because of that, no TAIR loci were found and the whole GO section was skipped:
+  `YAP1C_GO_enrichment.csv` is missing. Batch 1's GO table exists and cannot be
+  reproduced for batch 2 until the mapping is fixed.
+- The 3 heatmap SVGs in batch 2 were previously written to the project root; they
+  now go to `output_batch2/results`.
+
+## Bottom line
+
+Both batches give the same qualitative answer: the specific YAP1C interactors
+are dominated by proteins absent from the control, and high light does not
+change their capture by intensity. Batch 2 is too small, and its detection test
+too underpowered, to confirm or contradict the few treatment-leaning proteins
+batch 1 reported; treat batch 2 as supporting evidence for the identity of
+interactors, not for their light response.

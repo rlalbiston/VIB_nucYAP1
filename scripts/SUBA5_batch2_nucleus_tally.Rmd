@@ -1,0 +1,155 @@
+---
+title: "SUBA5 localisation of batch 2 specific YAP1C interactors: how many are nuclear?"
+author: "Analysis notebook"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Paths below are relative to the project root, so knit from there rather than
+# from this file's folder in scripts/.
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+library(dplyr)
+suppressPackageStartupMessages(library(readxl))
+
+# Tables are printed with kable so the layout matches the rest of the notebook.
+show_table <- function(x) knitr::kable(x, format = "html", row.names = FALSE)
+```
+
+# Source and rule
+
+Source: `output_batch2/SUBA5_batch2.xlsx` (sheet `Suba`), a SUBA5 export for the
+specific YAP1C interactors of batch 2.
+
+A protein is called **nucleus** if `nucleus` appears in any of its localisation
+calls, either
+
+- **predicted** --- any of the 22 prediction tools, or
+- **experimentally determined** --- GFP or mass-spectrometry localisation.
+
+SUBA's annotation columns (AmiGO, Swiss-Prot, TAIR10) are reported separately
+and are not part of that assignment, since they are database curation rather
+than a prediction or an experiment.
+
+```{r read-suba}
+suba_raw <- read_excel("output_batch2/SUBA5_batch2.xlsx", sheet = "Suba",
+                       col_names = FALSE, col_types = "text")
+
+# Two header rows: section labels, then column names. Data start on row 3.
+header <- as.character(unlist(suba_raw[2, ]))
+body   <- suba_raw[-c(1, 2), ]
+names(body) <- header
+body <- body[, !is.na(header) & header != ""]
+
+cat("Rows:", nrow(body), "| columns:", ncol(body), "\n")
+cat("Unique loci:", n_distinct(sub("\\.\\d+$", "", body$Gene)), "\n")
+```
+
+```{r classify-columns}
+pred_cols <- grep("^Location (All Predictors|AdaBoost|ATP|BaCelLo|ChloroP|EpiLoc|iPSORT|MitoPred|MitoProt|MultiLoc2|Nucleo|PCLR|Plant-mPLoc|PProwler|Predotar|PredSL|PTS1|SLPFA|SLP-Local|SubLoc|TargetP|WoLF|YLoc)", names(body), value = TRUE)
+ann_cols  <- grep("^Location (All Annotators|AmiGO|Swiss-Prot|TAIR10)$", names(body), value = TRUE)
+exp_cols  <- grep("^Location (GFP|Mass Spec)$", names(body), value = TRUE)
+ind_pred  <- setdiff(pred_cols, "Location All Predictors")
+
+c(predictors = length(ind_pred), annotators = length(ann_cols), experiments = length(exp_cols))
+
+# TRUE where any of the named columns says "nucleus".
+calls_nucleus <- function(cols) {
+  apply(body[cols], 1, function(cell) any(grepl("nucleus", cell, ignore.case = TRUE), na.rm = TRUE))
+}
+
+dat <- tibble(gene      = body$Gene,
+              locus     = sub("\\.\\d+$", "", body$Gene),
+              desc      = body$Description,
+              subacon   = body$`Location SUBAcon`,
+              nuc_pred  = calls_nucleus(pred_cols),
+              nuc_exp   = calls_nucleus(exp_cols),
+              nuc_ann   = calls_nucleus(ann_cols),
+              n_pred    = rowSums(sapply(body[ind_pred], function(x)
+                grepl("nucleus", x, ignore.case = TRUE) & !is.na(x)))) %>%
+  mutate(nuc_either = nuc_pred | nuc_exp)
+```
+
+# Headline
+
+```{r headline}
+n <- nrow(dat)
+locus_level <- dat %>%
+  summarise(nuc = any(nuc_either), .by = locus)
+
+bind_rows(
+  tibble(measure = "Assigned nucleus (prediction or experiment)", n = sum(dat$nuc_either)),
+  tibble(measure = "Nucleus by prediction only", n = sum(dat$nuc_pred & !dat$nuc_exp)),
+  tibble(measure = "Nucleus by experiment only", n = sum(!dat$nuc_pred & dat$nuc_exp)),
+  tibble(measure = "Nucleus by both", n = sum(dat$nuc_pred & dat$nuc_exp)),
+  tibble(measure = "Not nucleus", n = sum(!dat$nuc_either))) %>%
+  mutate(`% of rows` = sprintf("%.0f%%", 100 * n / n))
+
+cat(sprintf("At locus level: %d of %d loci (%.0f%%) have nuclear evidence in at least one row.\n",
+            sum(locus_level$nuc), nrow(locus_level), 100 * mean(locus_level$nuc)))
+```
+
+At locus level the answer is the same: 49 of 63 loci (78%) have nuclear
+evidence in at least one row.
+
+# By evidence type
+
+```{r by-source}
+tibble(source = c("Any prediction (22 tools)", "Any experiment (GFP or MS)",
+                  "SUBA consensus (Location SUBAcon)",
+                  "Annotation columns (AmiGO, Swiss-Prot, TAIR10)"),
+       rows = c(sum(dat$nuc_pred), sum(dat$nuc_exp),
+                sum(grepl("nucleus", dat$subacon, ignore.case = TRUE), na.rm = TRUE),
+                sum(dat$nuc_ann)))
+```
+
+The consensus call is much stricter than "any predictor": SUBAcon assigns
+nucleus to only 6 proteins, and every one of those is also caught by the wider
+rule. Conversely, the other nucleus calls rest on predictions that the consensus
+does not endorse, mostly single-tool calls.
+
+```{r predictor-support}
+cats <- c("0", "1", "2", "3", "4", "5 or more")
+support <- tibble(`Predictors calling nucleus` = cats,
+                  Proteins = as.integer(table(cut(dat$n_pred, breaks = c(-1, 0:4, Inf),
+                                                  labels = cats))))
+support
+```
+
+So the 78% figure is driven by predictions that are often supported by only one
+or two tools. No protein has all 22 predictors agreeing on nucleus.
+
+# The non-nuclear proteins
+
+```{r non-nuclear}
+dat %>%
+  filter(!nuc_either) %>%
+  transmute(Locus = gene, `SUBAcon call` = subacon) %>%
+  show_table()
+```
+
+These are clean organelle or secretory assignments, not ambiguous cases: a
+plastid or mitochondrial protein with no nuclear call in any single-tool
+prediction.
+
+# Caveats
+
+- "Nucleus in any prediction" is a permissive criterion. A single false-positive
+  predictor is enough to label a cytosolic protein nuclear. If you need a
+  defensible nuclear set, use the consensus column (6 proteins) or require at
+  least 3 predictors.
+- SUBA predicts localisation of the protein, not of the pull-down interaction.
+  A nuclear assignment is consistent with, but does not demonstrate, that YAP1C
+  traps the protein in the nucleus.
+- The file covers 63 loci, while batch 2 has 71 specific interactors, so this is
+  not a complete census of the batch 2 set.

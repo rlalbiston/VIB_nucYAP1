@@ -1,0 +1,1438 @@
+---
+title: "YAP1C sulfenome (DIA-NN): specific interactors and their response to high light"
+author: "Analysis notebook"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  # ---- input files -------------------------------------------------------
+  parquet:      "data/HL_nucYAP1_batch1/DIA-NN_output/report.parquet"
+  design:       "data/HL_nucYAP1_batch1/DIA-NN_output/experiment_design.tsv"
+  prot_desc:    "data/HL_nucYAP1_batch1/DIA-NN_output/report.protein_description.tsv"
+  outdir:       "output_batch1/results"
+  # ---- DIA-NN confidence cut-offs (1% FDR throughout) --------------------
+  q_value:      0.01   # precursor q-value, per run
+  pg_q_value:   0.01   # protein-group q-value, per run
+  global_q:     0.01   # precursor q-value, across the whole experiment
+  # ---- what counts as a reproducible identification ----------------------
+  min_reps:     3      # must be seen in >= 3 of the 4 replicates of a group
+  min_peptides: 1      # supported by >= this many distinct peptides ...
+  min_proteotypic: 1   # ... of which >= this many are unique to the group
+  # ---- statistics (one FDR and one fold-change cut-off, used everywhere) -
+  fdr:          0.05   # BH-adjusted p-value cut-off
+  log2fc:       1      # fold-change cut-off (1 on the log2 scale = 2-fold)
+  # ---- which proteins go into the high-light vs normal-light comparison --
+  include_enriched: true   # true = use both routes to specificity (see Step 2)
+  # ---- UniProt -> Ensembl peptide IDs (biomaRt / Ensembl Plants) ---------
+  mart_host:    "https://plants.ensembl.org"
+  mart_dataset: "athaliana_eg_gene"
+  pep_id_cache: "uniprot_to_ensembl_peptide.csv"   # cached so re-knits skip Ensembl
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Notebook-wide display settings. Hidden from the report.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+
+# Paths below are relative to the project root, so knit from there rather than
+# from this file's folder in scripts/.
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+# The settings above (the `params:` block in the header) are created for you
+# when you press **Knit**. If you would rather run the chunks one at a time,
+# run this line first so that `params` exists:
+#   params <- rmarkdown::yaml_front_matter("scripts/nucYAP1_batch1_analysis.Rmd")$params
+```
+
+# What this notebook does
+
+This is a **YAP1C sulfenome pull-down** in *Arabidopsis thaliana*, measured
+by data-independent acquisition (DIA) and searched with
+[DIA-NN](https://github.com/vdemichev/diann#basics-of-dia-data-analysis).
+
+- **YAP1C** carries a reactive cysteine that forms a mixed disulfide with
+  **sulfenylated** (--SOH) cysteines on other proteins, so it traps the
+  oxidised interactome.
+- **YAP1A** is the matched negative control (the reactive cysteine is
+  mutated). Anything it pulls down is sticking to the bait for reasons
+  unrelated to sulfenylation, i.e. it is **background**.
+- **HL** = high light (oxidative stress), **NL** = normal light (control).
+
+Balanced 2 x 2 design, 4 biological replicates per group, 16 runs:
+
+| Probe (file code) | NL replicates | HL replicates |
+|-------------------|---------------|---------------|
+| YAP1A (`YA`)      | runs 1--4     | runs 5--8     |
+| YAP1C (`YC`)      | runs 13--16   | runs 9--12    |
+
+## The four steps
+
+1.  **Call interactors.** Keep a protein if, in at least one YAP1C
+    condition, it was identified in **>= `r params$min_reps` of 4
+    replicates** and supported by **>= `r params$min_peptides` peptide(s),
+    at least `r params$min_proteotypic` of them unique** to that protein
+    group.
+2.  **Decide which of those are specific to the active probe**, using two
+    independent arguments (the two "Step 2" sections below):
+    - **Route A --- absent from YAP1A.** The protein is never seen with a
+      unique peptide in any control sample.
+    - **Route B --- enriched over YAP1A.** The protein *is* seen in the
+      control, but is significantly and substantially more abundant with
+      YAP1C (limma, BH-adjusted p < `r params$fdr`, log2FC >
+      `r params$log2fc`).
+    The **specific interactor set** is the union of the two.
+3.  **Ask how high light changes the capture of those proteins**, with two
+    complementary tests:
+    - **intensity** (limma on log2 MaxLFQ) for proteins quantified in both
+      treatments;
+    - **detection** (Fisher's exact test on replicate counts) which also
+      reaches the on/off proteins that limma cannot test.
+    A coverage check then records which arm reached which protein, and
+    writes out anything neither arm could test.
+4.  **Merge the two tests into one verdict per protein** and draw the
+    heatmaps.
+
+## Version note
+
+Compared with the previous version of this notebook:
+
+- The high-light-vs-normal-light comparison now runs on **both** routes to
+  specificity (route A **and** route B). Previously it used route A only,
+  so every protein that stuck to both probes but stuck much harder to
+  YAP1C was dropped before the HL/NL test.
+- Duplicated FDR / fold-change / minimum-replicate settings were collapsed
+  into one of each (`fdr`, `log2fc`, `min_reps`), so the same rule is
+  applied everywhere.
+- One heatmap function now serves all four heatmaps; the redundant
+  z-scored heatmap and the two "if this package is missing, do something
+  else" fallbacks were removed.
+- A **test coverage** section now audits both arms protein by protein,
+  writes the proteins neither arm could test to their own CSV, and gives
+  them a distinct verdict (`not testable`) instead of filing them under
+  "no clear difference". Both arms report their coverage split by route, so
+  it is visible that the limma-enriched proteins enter both.
+- A stacked bar summarises how much of the broadened set is
+  treatment-specific, overall and per route.
+- A **GO enrichment** section tests the broadened set, and the HL- and
+  NL-specific subsets, against the proteins actually detected in this
+  experiment, and draws a term-by-list heatmap.
+
+## Glossary
+
+| Term | Plain meaning |
+|------|---------------|
+| **protein group** | A set of proteins that share the peptides seen, so they cannot be told apart. Written as UniProt accessions joined by `;`. |
+| **proteotypic / unique peptide** | A peptide that belongs to only one protein group --- unambiguous evidence. |
+| **precursor** | One peptide in one charge state; the thing the mass spectrometer actually measures. |
+| **q-value / FDR** | The false-discovery rate. 1% means about 1 in 100 accepted identifications is expected to be wrong. |
+| **PG.MaxLFQ** | DIA-NN's protein abundance estimate. Analysed as log2, where +1 means 2-fold higher. |
+| **log2FC** | log2 fold-change. 1 = 2-fold up, -1 = 2-fold down. |
+| **adjusted p-value** | p-value corrected for testing thousands of proteins (Benjamini-Hochberg). Judge significance on this, not the raw p-value. |
+| **limma** | A test that borrows variance information across all proteins, which makes it more reliable than a t-test at n = 4. |
+| **NA / grey cell** | Not quantified in that run --- either genuinely absent or below the detection limit. Never treated as zero. |
+
+------------------------------------------------------------------------
+
+# Packages
+
+```{r libs}
+# Install anything missing, then load. limma comes from Bioconductor.
+cran <- c("dplyr", "tidyr", "tibble", "stringr", "readr", "ggplot2", "ggrepel")
+gaps <- cran[!vapply(cran, requireNamespace, logical(1), quietly = TRUE)]
+if (length(gaps)) install.packages(gaps, repos = "https://cloud.r-project.org")
+
+if (!requireNamespace("limma", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  BiocManager::install("limma", update = FALSE, ask = FALSE)
+}
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(tibble)
+  library(stringr); library(readr); library(ggplot2)
+})
+
+# report.parquet reader: use arrow if present, otherwise nanoparquet.
+read_parquet_any <- function(path) {
+  if (requireNamespace("arrow", quietly = TRUE))
+    return(as.data.frame(arrow::read_parquet(path)))
+  if (!requireNamespace("nanoparquet", quietly = TRUE))
+    install.packages("nanoparquet", repos = "https://cloud.r-project.org")
+  as.data.frame(nanoparquet::read_parquet(path))
+}
+
+# Ensembl Plants connection, used for peptide IDs and for GO terms. Both results
+# are cached to disk, so this only runs on the first knit.
+plants_mart <- function() {
+  if (!requireNamespace("biomaRt", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    BiocManager::install("biomaRt", update = FALSE, ask = FALSE)
+  }
+  biomaRt::useDataset(dataset = params$mart_dataset,
+                      mart    = biomaRt::useMart(biomart = "plants_mart",
+                                                 host = params$mart_host))
+}
+
+dir.create(params$outdir, showWarnings = FALSE, recursive = TRUE)
+```
+
+------------------------------------------------------------------------
+
+# Sample sheet
+
+```{r design}
+# Which raw file is which probe and which light condition.
+design <- read_tsv(params$design, show_col_types = FALSE)
+stopifnot(all(c("Run", "Genotype", "Treatment") %in% names(design)))
+
+design <- design %>%
+  mutate(Genotype  = factor(recode(Genotype, YA = "YAP1A", YC = "YAP1C"),
+                            levels = c("YAP1A", "YAP1C")),
+         Treatment = factor(Treatment, levels = c("NL", "HL")),
+         Group     = paste(Genotype, Treatment, sep = "_")) %>%
+  arrange(Genotype, Treatment, Run)     # this order is reused by every heatmap
+
+design
+table(design$Genotype, design$Treatment)
+```
+
+------------------------------------------------------------------------
+
+# DIA-NN report: load and apply the confidence filters
+
+`report.parquet` is the long precursor-level table: one row per precursor
+per run. We keep only target precursors that pass the 1% FDR cut-offs and
+carry a positive quantity.
+
+```{r load-report}
+rep_raw <- read_parquet_any(params$parquet)
+cat("Raw report:", nrow(rep_raw), "rows x", ncol(rep_raw), "columns\n")
+
+stopifnot(all(c("Run", "Protein.Group", "Stripped.Sequence", "Proteotypic",
+                "Q.Value", "PG.Q.Value", "PG.MaxLFQ",
+                "Precursor.Quantity") %in% names(rep_raw)))
+
+rep <- rep_raw
+if ("Decoy" %in% names(rep))          rep <- filter(rep, Decoy == 0)
+rep <- filter(rep, Q.Value    <= params$q_value,
+                   PG.Q.Value <= params$pg_q_value,
+                   Precursor.Quantity > 0)
+if ("Global.Q.Value" %in% names(rep)) rep <- filter(rep, Global.Q.Value <= params$global_q)
+
+rep <- inner_join(rep, design, by = "Run")
+
+cat("Confident rows kept:", nrow(rep), "\n")
+cat("Runs found:", n_distinct(rep$Run), "of", nrow(design), "\n")
+cat("Protein groups:", n_distinct(rep$Protein.Group), "\n")
+```
+
+## Identification QC
+
+Each bar is one run. Bars of very different height within a group point to
+a weak injection or an unequal pull-down, which is worth knowing before
+interpreting any statistics.
+
+```{r qc-ids}
+qc <- rep %>%
+  group_by(Run, Group) %>%
+  summarise(precursors     = n_distinct(Precursor.Id),
+            peptides       = n_distinct(Stripped.Sequence),
+            protein_groups = n_distinct(Protein.Group), .groups = "drop") %>%
+  arrange(Group, Run)
+qc
+
+ggplot(qc, aes(reorder(Run, protein_groups), protein_groups, fill = Group)) +
+  geom_col() + coord_flip() +
+  labs(x = NULL, y = "Protein groups (1% FDR)", fill = NULL,
+       title = "Protein-group identifications per run") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# How much evidence supports each protein, in each condition
+
+For every protein group, in each probe x light condition, count: how many
+replicates saw it, how many distinct peptides support it, and how many of
+those peptides are unique to it.
+
+```{r detection}
+evidence <- rep %>%
+  group_by(Protein.Group, Genotype, Treatment) %>%
+  summarise(n_reps_detected        = n_distinct(Run),
+            n_peptides             = n_distinct(Stripped.Sequence),
+            n_proteotypic_peptides = n_distinct(Stripped.Sequence[Proteotypic == 1]),
+            .groups = "drop")
+
+# Same information one protein per row, for the exported tables.
+evidence_wide <- evidence %>%
+  pivot_wider(id_cols = Protein.Group,
+              names_from  = c(Genotype, Treatment),
+              values_from = c(n_reps_detected, n_peptides, n_proteotypic_peptides),
+              values_fill = 0)
+head(evidence_wide)
+```
+
+------------------------------------------------------------------------
+
+# Ensembl peptide IDs and protein annotation
+
+Protein groups are keyed by UniProt accession, which is hard to read at the
+bench. Here we attach an `ensembl_peptide_id` (AGI-style, e.g.
+`AT3G14630.2`) to every group so all lists and figures can be read in
+TAIR/Ensembl terms. Where a group carries several accessions
+(`A0A1I9LTL1;F4IW82`), each is translated in place and re-joined in the same
+order (`AT3G14630.2;AT3G14630.1`).
+
+IDs come from **Ensembl Plants** via **biomaRt** (`athaliana_eg_gene`,
+filter `uniprotkb_all`, attribute `ensembl_peptide_id`) and are cached in
+`` `r file.path(params$outdir, params$pep_id_cache)` `` so later knits do
+not query the server again. If Ensembl is unreachable, or an accession has
+no mapped peptide, that position falls back to the UniProt accession --- no
+row is ever left blank.
+
+```{r peptide-id-map}
+pg_all    <- unique(rep$Protein.Group)
+acc_by_pg <- str_split(pg_all, ";")            # accessions per group, order kept
+all_acc   <- unique(unlist(acc_by_pg))
+all_acc   <- all_acc[nzchar(all_acc)]
+
+cache_path <- file.path(params$outdir, params$pep_id_cache)
+if (file.exists(cache_path)) {
+  u2p <- read_csv(cache_path, show_col_types = FALSE)
+} else {
+  u2p <- tryCatch({
+    biomaRt::getBM(attributes = c("uniprotkb_all", "ensembl_peptide_id"),
+                   filters    = "uniprotkb_all",
+                   values     = all_acc,
+                   mart       = plants_mart()) %>%
+      filter(nzchar(uniprotkb_all), nzchar(ensembl_peptide_id))
+  }, error = function(e) {
+    cat("!! biomaRt query failed:", conditionMessage(e),
+        "\n   peptide IDs will fall back to UniProt accessions.\n")
+    tibble(uniprotkb_all = character(), ensembl_peptide_id = character())
+  })
+  if (nrow(u2p)) write_csv(u2p, cache_path)
+}
+
+# One representative peptide ID per accession -> fast lookup table.
+lut <- u2p %>%
+  filter(nzchar(ensembl_peptide_id)) %>%
+  group_by(uniprotkb_all) %>%
+  summarise(pep = first(ensembl_peptide_id), .groups = "drop") %>%
+  { setNames(.$pep, .$uniprotkb_all) }
+
+pg_pep_map <- tibble(
+  Protein.Group = pg_all,
+  ensembl_peptide_id = vapply(acc_by_pg, function(accs) {
+    pep <- unname(lut[accs])
+    gap <- is.na(pep) | !nzchar(pep)
+    pep[gap] <- accs[gap]                      # fall back to the accession
+    paste(pep, collapse = ";")
+  }, character(1)))
+
+# pep_label() is used by every figure that needs a readable protein label.
+pg2pep    <- setNames(pg_pep_map$ensembl_peptide_id, pg_pep_map$Protein.Group)
+pep_label <- function(pg) {
+  out <- unname(pg2pep[pg])
+  gap <- is.na(out) | !nzchar(out)
+  out[gap] <- sub(";.*$", "", pg[gap])         # leading UniProt accession
+  out
+}
+
+cat(sprintf("Mapped %d/%d accessions; %d/%d protein groups fully mapped.\n",
+            sum(all_acc %in% names(lut)), length(all_acc),
+            sum(vapply(acc_by_pg, function(a) all(a %in% names(lut)), logical(1))),
+            length(pg_all)))
+head(pg_pep_map, 10)
+```
+
+```{r annotation}
+# One annotation row per protein group. This matters: the same group can carry
+# slightly different Genes/Protein.Names strings in different runs, and if we
+# kept all of them every later join would silently duplicate rows.
+annot <- rep %>%
+  group_by(Protein.Group) %>%
+  summarise(Protein.Ids   = first(Protein.Ids),
+            Protein.Names = first(Protein.Names),
+            Genes         = first(Genes), .groups = "drop") %>%
+  left_join(pg_pep_map, by = "Protein.Group")
+
+if (file.exists(params$prot_desc)) {
+  pd <- read_tsv(params$prot_desc, show_col_types = FALSE) %>%
+    group_by(Protein.Id) %>%
+    summarise(Description = first(Description), .groups = "drop")
+  annot <- annot %>%
+    mutate(.first = str_split_fixed(Protein.Ids, ";", 2)[, 1]) %>%
+    left_join(pd, by = c(".first" = "Protein.Id")) %>%
+    select(-.first)
+}
+
+stopifnot(!anyDuplicated(annot$Protein.Group))   # guard: exactly one row per group
+```
+
+------------------------------------------------------------------------
+
+# Step 1: call YAP1C interactors
+
+A protein group is an **interactor** if, in at least one YAP1C condition
+(NL or HL), it was detected in >= `r params$min_reps`/4 replicates and
+supported by >= `r params$min_peptides` distinct peptide(s), of which at
+least `r params$min_proteotypic` is unique to the group.
+
+> With the current settings this is the rule *"at least one unique
+> peptide, reproducibly in `r params$min_reps` of 4 replicates"*. If you
+> want the stricter two-peptide rule, set `min_peptides: 2` in the header
+> --- nothing else needs to change.
+
+```{r interactors}
+yc_qual <- evidence %>%
+  filter(Genotype == "YAP1C") %>%
+  mutate(passes = n_reps_detected        >= params$min_reps &
+                  n_peptides             >= params$min_peptides &
+                  n_proteotypic_peptides >= params$min_proteotypic) %>%
+  select(Protein.Group, Treatment, passes) %>%
+  pivot_wider(names_from = Treatment, values_from = passes, values_fill = FALSE)
+
+yc_interactors <- yc_qual %>%
+  filter(HL | NL) %>%
+  mutate(qualifies_in = case_when(HL & NL ~ "both", HL ~ "HL", TRUE ~ "NL"))
+
+cat("YAP1C interactors:", nrow(yc_interactors), "\n")
+table(yc_interactors$qualifies_in)
+```
+
+------------------------------------------------------------------------
+
+# Step 2, route A: proteins absent from YAP1A
+
+Any protein group with **>= 1 unique peptide in any YAP1A sample** is
+called background. This is deliberately strict --- a single unique peptide
+in one control run is enough to disqualify a protein --- so route A on its
+own is conservative and will discard real targets that also bind the
+control weakly. Route B (next section) is what recovers them.
+
+```{r route-a}
+ya_background <- rep %>%
+  filter(Genotype == "YAP1A", Proteotypic == 1) %>%
+  distinct(Protein.Group) %>% pull(Protein.Group)
+
+absent_in_YA <- yc_interactors %>% filter(!Protein.Group %in% ya_background)
+
+cat("YAP1A background groups (>=1 unique peptide in a control run):",
+    length(ya_background), "\n")
+cat("Route A - interactors absent from YAP1A:", nrow(absent_in_YA), "\n")
+
+write_csv(absent_in_YA %>% left_join(annot, by = "Protein.Group") %>%
+            left_join(evidence_wide, by = "Protein.Group") %>% arrange(Genes),
+          file.path(params$outdir, "unique_YAP1C_interactors.csv"))
+write_csv(tibble(Protein.Group = ya_background) %>% left_join(annot, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1A_background_list.csv"))
+write_csv(yc_interactors %>% left_join(annot, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_all_interactors.csv"))
+
+tibble(step = c("Protein groups in the filtered report",
+                "YAP1C interactors",
+                "of which also in YAP1A background",
+                "Route A: absent from YAP1A"),
+       n = c(n_distinct(rep$Protein.Group),
+             nrow(yc_interactors),
+             sum(yc_interactors$Protein.Group %in% ya_background),
+             nrow(absent_in_YA)))
+```
+
+------------------------------------------------------------------------
+
+# Step 2, route B: proteins enriched in YAP1C over YAP1A
+
+Here we keep the proteins route A throws away, and ask a quantitative
+question instead: *is this protein pulled down substantially more by the
+active probe than by the control?*
+
+**Intensity table.** One log2 `PG.MaxLFQ` value per protein per run, all 16
+samples. (MaxLFQ is constant across the precursors of a group within a run,
+so one value per Run x Protein.Group defines the matrix.)
+
+```{r matrix-all}
+pg_long <- rep %>%
+  distinct(Run, Protein.Group, PG.MaxLFQ) %>%
+  filter(!is.na(PG.MaxLFQ), PG.MaxLFQ > 0)
+stopifnot(!anyDuplicated(pg_long[c("Run", "Protein.Group")]))   # one value per cell
+
+log2_all <- pg_long %>%
+  pivot_wider(names_from = Run, values_from = PG.MaxLFQ) %>%
+  column_to_rownames("Protein.Group") %>%
+  as.matrix() %>% log2()
+# columns in a fixed, readable order: YAP1A NL, YAP1A HL, YAP1C NL, YAP1C HL
+log2_all <- log2_all[, design$Run[design$Run %in% colnames(log2_all)], drop = FALSE]
+
+meta <- design %>% filter(Run %in% colnames(log2_all)) %>%
+  arrange(match(Run, colnames(log2_all)))
+
+cat("Full matrix:", nrow(log2_all), "proteins x", ncol(log2_all), "runs",
+    sprintf("(%d YAP1A, %d YAP1C)\n",
+            sum(meta$Genotype == "YAP1A"), sum(meta$Genotype == "YAP1C")))
+```
+
+```{r heatmap-helper}
+# One function draws every heatmap in this notebook.
+#   pg    : protein groups to show, first one at the top
+#   mat   : log2 intensity matrix (log2_all = 16 samples, log2mat = 8 YAP1C samples)
+#   facet : how to split the columns ("Treatment", or "Genotype + Treatment")
+# Missing values stay grey - they are never filled in for plotting.
+lfq_heatmap <- function(pg, mat, facet = "Treatment", title = NULL, subtitle = NULL,
+                        max_rows_labelled = 80) {
+  pg <- unique(pg[pg %in% rownames(mat)])
+  if (!length(pg)) { cat("Nothing to plot for:", title, "\n"); return(invisible(NULL)) }
+  # optional = TRUE keeps the run names exactly as they are in the matrix
+  df <- as.data.frame(mat[pg, , drop = FALSE], optional = TRUE) %>%
+    rownames_to_column("Protein.Group") %>%
+    pivot_longer(-Protein.Group, names_to = "Run", values_to = "log2LFQ") %>%
+    left_join(select(design, Run, Genotype, Treatment), by = "Run") %>%
+    mutate(Run = factor(Run, levels = colnames(mat)),
+           Protein.Group = factor(Protein.Group, levels = rev(pg)))
+  ggplot(df, aes(Run, Protein.Group, fill = log2LFQ)) +
+    geom_tile(colour = "grey92") +
+    facet_grid(as.formula(paste(". ~", facet)), scales = "free_x", space = "free_x") +
+    scale_fill_viridis_c(option = "C", na.value = "grey88",
+                         name = "log2 LFQ\n(PG.MaxLFQ)") +
+    scale_y_discrete(labels = setNames(pep_label(pg), pg)) +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+          axis.text.y  = if (length(pg) <= max_rows_labelled) element_text(size = 6)
+                         else element_blank(),
+          panel.grid   = element_blank(),
+          strip.text   = element_text(size = 8))
+}
+
+# Sort protein groups by how much stronger they are in HL than in NL, biggest first.
+order_by_hl_minus_nl <- function(pg, mat, hl_runs, nl_runs) {
+  pg <- unique(pg[pg %in% rownames(mat)])
+  d  <- rowMeans(mat[pg, hl_runs, drop = FALSE], na.rm = TRUE) -
+        rowMeans(mat[pg, nl_runs, drop = FALSE], na.rm = TRUE)
+  pg[order(d, decreasing = TRUE, na.last = TRUE)]
+}
+
+# Sort by mean log2 LFQ across only the runs where the protein was detected
+# (na.rm drops the blanks), most abundant first. Use this rather than HL - NL
+# whenever a set contains treatment-exclusive proteins: one of their two means
+# is taken over nothing at all, so the difference is undefined and they would
+# otherwise be dumped at the bottom of the plot in arbitrary order.
+order_by_mean_lfq <- function(pg, mat) {
+  pg <- unique(pg[pg %in% rownames(mat)])
+  if (!length(pg)) return(pg)
+  m <- rowMeans(mat[pg, , drop = FALSE], na.rm = TRUE)
+  pg[order(m, decreasing = TRUE, na.last = TRUE)]
+}
+```
+
+**Missing values.** The 16 samples form four groups of four replicates
+(YAP1A_NL, YAP1A_HL, YAP1C_NL, YAP1C_HL). Within a group, a protein counts
+as **valid** if it was quantified in >= `r params$min_reps` of the 4
+replicates; missing cells in a valid group are filled with the mean of the
+replicates that *were* observed. Groups that fail the
+`r params$min_reps`/4 rule are left empty and are **not** invented ---
+limma simply ignores those samples for that protein.
+
+```{r route-b-prep}
+# Which columns belong to each of the four replicate groups.
+group_cols <- split(seq_len(nrow(meta)), meta$Group)
+
+# valid[protein, group] = TRUE if that group observed the protein >= min_reps times.
+valid <- sapply(group_cols, function(cols)
+  rowSums(!is.na(log2_all[, cols, drop = FALSE])) >= params$min_reps)
+
+# Fill the gaps inside valid groups with that group's observed mean.
+Xe <- log2_all
+for (g in colnames(valid)) {
+  cols <- group_cols[[g]]
+  gmean <- rowMeans(log2_all[, cols, drop = FALSE], na.rm = TRUE)
+  for (j in cols) {
+    hole <- is.na(Xe[, j]) & valid[, g]
+    Xe[hole, j] <- gmean[hole]
+  }
+}
+
+# Only proteins seen properly in BOTH probes can be compared between probes.
+seen_in_YA <- rowSums(valid[, grep("^YAP1A", colnames(valid)), drop = FALSE]) > 0
+seen_in_YC <- rowSums(valid[, grep("^YAP1C", colnames(valid)), drop = FALSE]) > 0
+Xe <- Xe[seen_in_YA & seen_in_YC, , drop = FALSE]
+
+cat("Proteins testable for YAP1C vs YAP1A (valid in >=", params$min_reps,
+    "/4 of a group in both probes):", nrow(Xe), "\n")
+```
+
+**The test.** limma with the design `~ 0 + Genotype` and the contrast
+**YAP1C - YAP1A**; variance is stabilised across proteins with empirical
+Bayes and p-values corrected by Benjamini-Hochberg. Light condition is
+pooled here, since the question is about the probe, not the light (to model
+light as well, use `~ 0 + Genotype + Treatment`). Proteins with adjusted p <
+`r params$fdr` **and** log2FC > `r params$log2fc` are the route B set.
+
+```{r route-b-test}
+des_g <- model.matrix(~ 0 + Genotype, data = meta)
+fit   <- limma::lmFit(Xe, des_g)
+fit   <- limma::contrasts.fit(
+  fit, limma::makeContrasts(GenotypeYAP1C - GenotypeYAP1A, levels = des_g))
+fit   <- limma::eBayes(fit)
+
+enr <- limma::topTable(fit, number = Inf, sort.by = "none") %>%
+  rownames_to_column("Protein.Group") %>%
+  transmute(Protein.Group, log2FC_YC_vs_YA = logFC, AveExpr, t,
+            pvalue = P.Value, adj_pvalue = adj.P.Val) %>%
+  mutate(class = case_when(
+    adj_pvalue < params$fdr & log2FC_YC_vs_YA >  params$log2fc ~ "enriched in YAP1C",
+    adj_pvalue < params$fdr & log2FC_YC_vs_YA <  0             ~ "enriched in YAP1A",
+    TRUE                                                       ~ "ns")) %>%
+  arrange(adj_pvalue)
+
+enriched_in_YC <- filter(enr, class == "enriched in YAP1C")
+
+write_csv(enr %>% left_join(annot, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_vs_YAP1A_limma.csv"))
+write_csv(enriched_in_YC %>% left_join(annot, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_enriched_significant.csv"))
+
+cat(sprintf("Route B - enriched in YAP1C (adj.p < %.2g & log2FC > %g): %d\n",
+            params$fdr, params$log2fc, nrow(enriched_in_YC)))
+enriched_in_YC %>%
+  transmute(uniprot = Protein.Group, peptide_id = pep_label(Protein.Group),
+            log2FC_YC_vs_YA, adj_pvalue) %>% head(25)
+```
+
+## Volcano: YAP1C vs YAP1A
+
+```{r route-b-volcano, fig.width=7, fig.height=6}
+ggplot(enr, aes(log2FC_YC_vs_YA, -log10(pvalue), colour = class)) +
+  geom_point(alpha = 0.6, size = 1) +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_vline(xintercept = params$log2fc, linetype = "dashed", colour = "grey40") +
+  ggrepel::geom_text_repel(data = head(enriched_in_YC, 25),
+                           aes(label = pep_label(Protein.Group)),
+                           size = 3, max.overlaps = 20) +
+  scale_colour_manual(values = c("enriched in YAP1C" = "#c0392b",
+                                 "enriched in YAP1A" = "#2471a3",
+                                 "ns" = "grey75")) +
+  labs(title = "YAP1C vs YAP1A (limma, both light conditions pooled)",
+       subtitle = sprintf("route B set: adj.p < %.2g & log2FC > %g",
+                          params$fdr, params$log2fc),
+       x = "log2 fold-change (YAP1C / YAP1A)", y = "-log10 p-value", colour = NULL) +
+  theme_minimal()
+```
+
+## The strongest route B proteins across all 16 samples
+
+Both contrasts read at once: **YAP1C vs YAP1A** across the probe panels,
+**NL vs HL** within each probe.
+
+```{r route-b-heatmap, fig.width=9, fig.height=8}
+top_enriched <- head(enriched_in_YC$Protein.Group[
+  order(enriched_in_YC$log2FC_YC_vs_YA, decreasing = TRUE)], 60)
+
+lfq_heatmap(top_enriched, mat = log2_all, facet = "Genotype + Treatment",
+            title = "Top route B proteins (enriched in YAP1C) - log2 LFQ",
+            subtitle = "up to 60 proteins, strongest enrichment at the top; grey = not quantified")
+```
+
+------------------------------------------------------------------------
+
+# Step 2, combined: the specific interactor set carried forward
+
+The two routes answer the same question with different evidence, so we take
+their **union**. Note that they are nearly non-overlapping *by
+construction*: route A requires a protein to be absent from YAP1A, while
+route B requires it to be quantified in YAP1A. The small `both routes`
+overlap is made up of proteins detected in the control **only via shared
+(non-unique) peptides** --- enough to be quantified, not enough to count as
+background.
+
+**This union is the set used by every HL-vs-NL analysis below.**
+
+```{r specific-set}
+specific <- annot %>%
+  filter(Protein.Group %in% union(absent_in_YA$Protein.Group,
+                                  enriched_in_YC$Protein.Group)) %>%
+  mutate(in_A = Protein.Group %in% absent_in_YA$Protein.Group,
+         in_B = Protein.Group %in% enriched_in_YC$Protein.Group,
+         route = case_when(in_A & in_B ~ "both routes",
+                           in_A        ~ "A: absent from YAP1A",
+                           TRUE        ~ "B: enriched over YAP1A")) %>%
+  select(-in_A, -in_B) %>%
+  left_join(select(yc_interactors, Protein.Group, qualifies_in), by = "Protein.Group") %>%
+  # Route B proteins were selected on abundance alone; this flags whether they
+  # also clear the step-1 evidence bar (>= min_reps replicates + unique peptide).
+  mutate(passes_step1 = !is.na(qualifies_in))
+
+if (!isTRUE(params$include_enriched))
+  specific <- filter(specific, route != "B: enriched over YAP1A")
+
+write_csv(specific, file.path(params$outdir, "YAP1C_specific_interactors_broadened.csv"))
+
+cat("Specific interactors carried into the HL vs NL analysis:", nrow(specific), "\n")
+print(table(specific$route))
+cat("\nOf these, how many also pass the step-1 evidence rule:\n")
+print(table(route = specific$route, passes_step1 = specific$passes_step1))
+```
+
+------------------------------------------------------------------------
+
+# Intensity table for the YAP1C samples
+
+The eight YAP1C runs, restricted to the specific interactors. This is a
+straight subset of the 16-sample matrix built above, so the two halves of
+the notebook cannot drift apart.
+
+```{r matrix-yc}
+yc_meta <- filter(meta, Genotype == "YAP1C")
+yc_runs <- yc_meta$Run                                   # NL block, then HL block
+hl_runs <- yc_meta$Run[yc_meta$Treatment == "HL"]
+nl_runs <- yc_meta$Run[yc_meta$Treatment == "NL"]
+
+log2mat <- log2_all[intersect(specific$Protein.Group, rownames(log2_all)), yc_runs,
+                    drop = FALSE]
+log2mat <- log2mat[rowSums(!is.na(log2mat)) > 0, , drop = FALSE]
+
+cat("HL vs NL matrix:", nrow(log2mat), "proteins x", ncol(log2mat), "YAP1C runs\n")
+cat("Specific interactors with no MaxLFQ value in any YAP1C run (not plottable):",
+    nrow(specific) - nrow(log2mat), "\n")
+```
+
+```{r pca, fig.height=4}
+# Sanity check: do the replicates separate by light condition?
+ok <- log2mat[rowSums(is.na(log2mat)) == 0, , drop = FALSE]
+ok <- ok[rowSums((ok - rowMeans(ok))^2) > 0, , drop = FALSE]   # drop flat rows
+if (nrow(ok) > 2) {
+  pca <- prcomp(t(ok), scale. = TRUE)
+  ve  <- round(100 * summary(pca)$importance[2, 1:2])
+  as.data.frame(pca$x[, 1:2]) %>% rownames_to_column("Run") %>%
+    left_join(select(design, Run, Treatment), by = "Run") %>%
+    ggplot(aes(PC1, PC2, colour = Treatment, label = Run)) +
+      geom_point(size = 3) +
+      ggrepel::geom_text_repel(size = 3, show.legend = FALSE) +
+      labs(title = "PCA of the YAP1C samples",
+           subtitle = sprintf("%d proteins quantified in all 8 runs", nrow(ok)),
+           x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)")) +
+      theme_minimal()
+} else cat("Too few complete-case proteins for a PCA.\n")
+```
+
+------------------------------------------------------------------------
+
+# Step 3, arm 1: HL vs NL by intensity (limma)
+
+This arm asks *"is the protein captured more strongly?"*, so it needs
+numbers in both treatments: we test only proteins with >= `r params$min_reps`
+quantified values **in each** YAP1C group. Proteins present in essentially
+one treatment cannot be tested here --- they are picked up by arm 2, so
+nothing is quietly lost.
+
+```{r hl-vs-nl-quant-prep}
+n_HL <- rowSums(!is.na(log2mat[, hl_runs, drop = FALSE]))
+n_NL <- rowSums(!is.na(log2mat[, nl_runs, drop = FALSE]))
+X <- log2mat[n_HL >= params$min_reps & n_NL >= params$min_reps, , drop = FALSE]
+
+# Fill the few remaining gaps with that treatment's observed mean (every row
+# here already has at least min_reps real values per treatment).
+for (cols in list(hl_runs, nl_runs)) {
+  m <- rowMeans(X[, cols, drop = FALSE], na.rm = TRUE)
+  for (j in cols) { hole <- is.na(X[, j]); X[hole, j] <- m[hole] }
+}
+
+cat("Testable by intensity:", nrow(X), "of", nrow(log2mat), "specific interactors\n")
+# Broken down by how each protein earned its place in the specific set, so it is
+# visible that route B (limma-enriched) proteins enter this arm too.
+print(table(route  = specific$route[match(rownames(log2mat), specific$Protein.Group)],
+            fitted = ifelse(rownames(log2mat) %in% rownames(X), "yes", "no")))
+```
+
+```{r hl-vs-nl-quant-test}
+trt <- yc_meta$Treatment[match(colnames(X), yc_meta$Run)]   # NL / HL, one per column
+des <- model.matrix(~ 0 + trt)
+colnames(des) <- sub("^trt", "", colnames(des))             # -> "NL", "HL"
+
+fit <- limma::lmFit(X, des)
+fit <- limma::contrasts.fit(fit, limma::makeContrasts(HL - NL, levels = des))
+fit <- limma::eBayes(fit)
+
+de <- limma::topTable(fit, number = Inf, sort.by = "none") %>%
+  rownames_to_column("Protein.Group") %>%
+  transmute(Protein.Group, log2FC_HL_vs_NL = logFC, AveExpr, t,
+            pvalue = P.Value, adj_pvalue = adj.P.Val) %>%
+  mutate(direction = case_when(
+    adj_pvalue < params$fdr & log2FC_HL_vs_NL >=  params$log2fc ~ "up in HL",
+    adj_pvalue < params$fdr & log2FC_HL_vs_NL <= -params$log2fc ~ "down in HL",
+    TRUE                                                        ~ "ns")) %>%
+  arrange(adj_pvalue)
+
+write_csv(de %>% left_join(specific, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_NL_vs_HL_differential.csv"))
+
+cat(sprintf("Significant (adj.p < %.2g & |log2FC| >= %g): %d  (up in HL = %d, down = %d)\n",
+            params$fdr, params$log2fc, sum(de$direction != "ns"),
+            sum(de$direction == "up in HL"), sum(de$direction == "down in HL")))
+de %>% left_join(select(specific, Protein.Group, Genes, route), by = "Protein.Group") %>%
+  head(20)
+```
+
+## Volcano: HL vs NL
+
+```{r hl-vs-nl-volcano, fig.height=6}
+sig_line <- if (any(de$direction != "ns"))
+  -log10(max(de$pvalue[de$direction != "ns"], na.rm = TRUE)) else NA_real_
+
+ggplot(de, aes(log2FC_HL_vs_NL, -log10(pvalue), colour = direction)) +
+  geom_point(alpha = 0.7) +
+  geom_vline(xintercept = c(-1, 1) * params$log2fc, linetype = "dashed") +
+  { if (!is.na(sig_line))
+      geom_hline(yintercept = sig_line, linetype = "dashed", colour = "grey40") } +
+  ggrepel::geom_text_repel(data = filter(de, direction != "ns"),
+                           aes(label = pep_label(Protein.Group)),
+                           size = 3, max.overlaps = 20) +
+  scale_colour_manual(values = c("up in HL" = "#c0392b",
+                                 "down in HL" = "#2471a3", "ns" = "grey70")) +
+  labs(title = "High light vs normal light - specific YAP1C interactors",
+       subtitle = "dashed horizontal line = the significance threshold actually reached",
+       x = "log2 fold-change (HL / NL)", y = "-log10 p-value", colour = NULL) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Step 3, arm 2: HL vs NL by detection (Fisher's exact test)
+
+Covalent trapping by YAP1C behaves more like an **on/off** event near the
+detection limit than a graded fold-change, and in this kind of experiment
+the proteins that respond to high light are largely **gained or lost**
+rather than scaled up or down --- exactly the proteins arm 1 cannot test.
+So this arm ignores intensity and tests **detection**: for each specific
+interactor, count how many of the 4 HL and 4 NL replicates identified it,
+and apply Fisher's exact test to the 2 x 2 table.
+
+Two descriptive labels come out of the same counts:
+
+- **`detection_class`** --- the raw on/off picture: `HL-only`, `NL-only`
+  (seen at least once in one treatment, never in the other) or `shared`.
+- **`pattern`** --- how *reproducible* that is, using the
+  `r params$min_reps`/4 rule: `HL-exclusive`, `NL-exclusive` (reproducible
+  in one treatment, absent from the other), `HL-biased`, `NL-biased`
+  (reproducible in one, patchy in the other), `both treatments`, or
+  `sparse` (never reproducible anywhere).
+
+```{r hl-vs-nl-detection}
+n_rep_HL <- length(hl_runs); n_rep_NL <- length(nl_runs)
+
+det_counts <- rep %>%
+  filter(Genotype == "YAP1C", Protein.Group %in% specific$Protein.Group) %>%
+  group_by(Protein.Group, Treatment) %>%
+  summarise(n_det = n_distinct(Run), .groups = "drop")
+
+pa <- specific %>% select(Protein.Group) %>%
+  left_join(det_counts %>% filter(Treatment == "HL") %>%
+              transmute(Protein.Group, det_HL = n_det), by = "Protein.Group") %>%
+  left_join(det_counts %>% filter(Treatment == "NL") %>%
+              transmute(Protein.Group, det_NL = n_det), by = "Protein.Group") %>%
+  mutate(det_HL = replace_na(det_HL, 0L), det_NL = replace_na(det_NL, 0L),
+         detection_class = case_when(det_HL > 0 & det_NL == 0 ~ "HL-only",
+                                     det_NL > 0 & det_HL == 0 ~ "NL-only",
+                                     TRUE                     ~ "shared"),
+         pattern = case_when(
+           det_HL >= params$min_reps & det_NL == 0               ~ "HL-exclusive",
+           det_NL >= params$min_reps & det_HL == 0               ~ "NL-exclusive",
+           det_HL >= params$min_reps & det_NL <  params$min_reps ~ "HL-biased",
+           det_NL >= params$min_reps & det_HL <  params$min_reps ~ "NL-biased",
+           det_HL >= params$min_reps & det_NL >= params$min_reps ~ "both treatments",
+           TRUE                                                  ~ "sparse"),
+         # the coarse grouping used by the specificity bar chart and the GO analysis
+         specificity = case_when(
+           pattern %in% c("HL-exclusive", "HL-biased") ~ "HL-specific",
+           pattern %in% c("NL-exclusive", "NL-biased") ~ "NL-specific",
+           pattern == "both treatments"                ~ "both treatments",
+           TRUE                                        ~ "sparse"),
+         fisher_p = mapply(function(a, b)
+           fisher.test(matrix(c(a, n_rep_HL - a, b, n_rep_NL - b), nrow = 2))$p.value,
+           det_HL, det_NL),
+         fisher_adj = p.adjust(fisher_p, "BH"),
+         pa_direction = case_when(
+           fisher_adj < params$fdr & det_HL > det_NL ~ "more in HL",
+           fisher_adj < params$fdr & det_NL > det_HL ~ "more in NL",
+           TRUE                                      ~ "ns"),
+         tested_by_intensity = Protein.Group %in% rownames(X)) %>%
+  arrange(fisher_p, desc(abs(det_HL - det_NL)))
+
+write_csv(pa %>% left_join(specific, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_NL_vs_HL_presence_absence.csv"))
+write_csv(pa %>% filter(!tested_by_intensity) %>% left_join(specific, by = "Protein.Group"),
+          file.path(params$outdir, "YAP1C_condition_exclusive.csv"))
+
+cat("Detection pattern by route into the specific set:\n")
+print(table(route   = specific$route[match(pa$Protein.Group, specific$Protein.Group)],
+            pattern = pa$pattern))
+cat(sprintf("\nFisher test significant (adj.p < %.2g): %d  (more in HL = %d, more in NL = %d)\n",
+            params$fdr, sum(pa$pa_direction != "ns"),
+            sum(pa$pa_direction == "more in HL"), sum(pa$pa_direction == "more in NL")))
+pa %>% left_join(select(specific, Protein.Group, Genes, route), by = "Protein.Group") %>%
+  head(20)
+```
+
+> **How much can this test see?** With 4 versus 4 replicates the most
+> extreme table possible (4 vs 0) gives a two-sided Fisher p of about
+> 0.029. A perfectly clean on/off protein is therefore only just
+> significant before correction, and may well not survive BH adjustment
+> across thousands of proteins. Read `fisher_adj` as a **ranking of on/off
+> evidence** alongside the raw `det_HL` and `det_NL` counts, not as a
+> yes/no answer.
+
+## Detection landscape
+
+```{r detection-landscape, fig.height=4.5}
+ggplot(pa, aes(det_NL, det_HL)) +
+  geom_abline(slope = 1, intercept = 0, colour = "grey85") +
+  geom_count(aes(colour = detection_class), alpha = 0.8) +
+  scale_x_continuous(breaks = 0:n_rep_NL) + scale_y_continuous(breaks = 0:n_rep_HL) +
+  scale_colour_manual(values = c("HL-only" = "#c0392b",
+                                 "NL-only" = "#2471a3", "shared" = "#7f8c8d")) +
+  labs(title = "Detection landscape of the specific YAP1C interactors",
+       subtitle = "points off the diagonal are treatment-biased in detection",
+       x = sprintf("# NL replicates detected (of %d)", n_rep_NL),
+       y = sprintf("# HL replicates detected (of %d)", n_rep_HL),
+       size = "# proteins", colour = NULL) +
+  theme_minimal()
+```
+
+## Are they treatment-specific?
+
+The same detection patterns, counted rather than plotted per protein. The
+bars split the broadened set into proteins reproducibly captured in **one**
+light condition only (treatment-specific, red for HL and blue for NL) and
+proteins captured in **both** (grey). Bars are also shown per route, so you
+can see whether the two definitions of specificity behave the same way.
+
+```{r treatment-specificity-bar, fig.height=4.5}
+# Classes come straight from the arm 2 detection patterns, so this figure and
+# the tables above cannot disagree.
+spec_levels <- c("HL-exclusive", "HL-biased", "both treatments",
+                 "NL-biased", "NL-exclusive", "sparse")
+spec_cols <- c("HL-exclusive" = "#c0392b", "HL-biased"    = "#d98880",
+               "both treatments" = "#7f8c8d",
+               "NL-biased"    = "#7fb3d5", "NL-exclusive" = "#2471a3",
+               "sparse"       = "#d5dbdb")
+
+ts <- pa %>%
+  select(Protein.Group, pattern, specificity) %>%
+  left_join(select(specific, Protein.Group, route), by = "Protein.Group") %>%
+  mutate(pattern = factor(pattern, levels = spec_levels),
+         treatment_specific = specificity %in% c("HL-specific", "NL-specific"))
+
+# one bar per route, plus an "all interactors" bar for the set as a whole
+all_label  <- "All specific\ninteractors"
+ts_counts  <- bind_rows(mutate(ts, group = all_label), mutate(ts, group = route)) %>%
+  group_by(group, pattern) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(group = factor(group, levels = c(all_label, sort(unique(ts$route)))),
+         # dark fills need white numbers, light fills need dark ones
+         label_colour = ifelse(pattern %in% c("HL-biased", "NL-biased", "sparse"),
+                               "grey15", "white"))
+
+ggplot(ts_counts, aes(group, n, fill = pattern)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = n, colour = label_colour), size = 3,
+            position = position_stack(vjust = 0.5), show.legend = FALSE) +
+  scale_fill_manual(values = spec_cols, name = NULL) +
+  scale_colour_identity() +
+  labs(title = "Are the specific YAP1C interactors treatment-specific?",
+       subtitle = sprintf("%d of %d (%.0f%%) are reproducible in one light condition only (>= %d/4 there)",
+                          sum(ts$treatment_specific), nrow(ts),
+                          100 * mean(ts$treatment_specific), params$min_reps),
+       x = NULL, y = "protein groups") +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank())
+
+# the numbers behind the figure
+ts %>% group_by(route) %>%
+  summarise(n_interactors        = n(),
+            n_treatment_specific = sum(treatment_specific),
+            percent_specific     = round(100 * n_treatment_specific / n_interactors, 1),
+            .groups = "drop")
+```
+
+------------------------------------------------------------------------
+
+# Test coverage: which arm reached which protein
+
+Before reading any verdict it is worth knowing which proteins each arm could
+actually say something about, because the two arms have **different entry
+requirements** and use slightly different evidence:
+
+- **Arm 1 (intensity)** needs a MaxLFQ *number* in >= `r params$min_reps` of
+  the 4 replicates of **each** treatment. A protein quantified in only one
+  treatment cannot be fitted, and one identified but never quantified is
+  invisible to this arm (and to every heatmap) altogether.
+- **Arm 2 (detection)** only needs replicate *identification* counts, so it
+  reaches almost everything. Identification and quantification are not the
+  same thing --- a run can identify a protein and still report no MaxLFQ
+  value --- which is a common reason for dropping out of arm 1 while staying
+  in arm 2.
+
+`tested_in` therefore takes four values: `both arms`, `intensity only`,
+`detection only`, and `neither`. A protein counts as tested by arm 2 if its
+2 x 2 table contains at least one YAP1C identification; where HL and NL
+counts are **equal** the test still runs and returns p = 1, which is a real
+answer ("no detection difference"), not a failure --- the
+`detection_informative` column flags those so they are not over-read.
+`neither` means no result came out of either arm, and those proteins are
+written to their own CSV with the reason spelled out. Given how the
+specific set is built this should be empty; the code checks rather than
+assumes.
+
+```{r coverage-check}
+# n_HL / n_NL are the arm 1 inputs: how many YAP1C runs carry a MaxLFQ number.
+quant_counts <- tibble(Protein.Group = rownames(log2mat),
+                       n_quant_HL = unname(n_HL), n_quant_NL = unname(n_NL))
+
+coverage <- specific %>%
+  select(Protein.Group, ensembl_peptide_id, Genes, Protein.Names,
+         any_of("Description"), route, qualifies_in, passes_step1) %>%
+  left_join(quant_counts, by = "Protein.Group") %>%
+  left_join(select(pa, Protein.Group, det_HL, det_NL, pattern, fisher_p),
+            by = "Protein.Group") %>%
+  left_join(select(de, Protein.Group, adj_pvalue), by = "Protein.Group") %>%
+  mutate(
+    n_quant_HL = replace_na(n_quant_HL, 0),
+    n_quant_NL = replace_na(n_quant_NL, 0),
+    in_quant_matrix = Protein.Group %in% rownames(log2mat),
+    tested_by_intensity = !is.na(adj_pvalue),                      # limma fitted it
+    tested_by_detection = !is.na(fisher_p) & (det_HL + det_NL) > 0,# a non-empty 2x2 table
+    # equal HL and NL counts give p = 1 whatever the biology, so flag them
+    detection_informative = tested_by_detection & det_HL != det_NL,
+    tested_in = case_when(
+      tested_by_intensity & tested_by_detection ~ "both arms",
+      tested_by_intensity                       ~ "intensity only",
+      tested_by_detection                       ~ "detection only",
+      TRUE                                      ~ "neither"),
+    why_not_tested = case_when(
+      tested_in != "neither"                  ~ NA_character_,
+      is.na(det_HL) | is.na(det_NL)           ~ "no detection counts - unexpected, check the report",
+      det_HL + det_NL == 0 & !in_quant_matrix ~ "never identified and never quantified in any YAP1C run",
+      det_HL + det_NL == 0                    ~ "never identified in any YAP1C run",
+      TRUE                                    ~ "not fitted by arm 1 and no usable detection table")) %>%
+  select(-adj_pvalue, -fisher_p) %>%
+  arrange(factor(tested_in, levels = c("neither", "detection only",
+                                       "intensity only", "both arms")), Genes)
+
+write_csv(coverage, file.path(params$outdir, "YAP1C_NL_vs_HL_test_coverage.csv"))
+
+untested <- filter(coverage, tested_in == "neither")
+write_csv(untested, file.path(params$outdir, "YAP1C_NL_vs_HL_untested.csv"))
+
+cat("Coverage of the", nrow(coverage), "specific interactors, by route:\n")
+print(table(route = coverage$route, tested_in = coverage$tested_in))
+
+cat("\nTested by NEITHER arm:", nrow(untested), "\n")
+cat("Not fitted by arm 1, so relying on the detection answer alone:",
+    sum(!coverage$tested_by_intensity), "\n")
+cat("Identified but never quantified (invisible to arm 1 and to every heatmap):",
+    sum(!coverage$in_quant_matrix), "\n")
+cat("Equal HL and NL detection counts, so arm 2 can only return p = 1:",
+    sum(coverage$det_HL == coverage$det_NL, na.rm = TRUE), "\n")
+
+if (nrow(untested)) {
+  print(table(untested$why_not_tested))
+  untested %>% select(Protein.Group, Genes, route, n_quant_HL, n_quant_NL,
+                      det_HL, det_NL, why_not_tested) %>% head(30)
+} else {
+  cat("\n-> every specific interactor was reached by at least one arm.",
+      "\n   YAP1C_NL_vs_HL_untested.csv is written with headers and no rows.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+# Step 4: one verdict per protein
+
+Each specific interactor gets a single answer: the **intensity** result
+where the protein was testable in both treatments, otherwise the
+**detection** result. Two columns keep the reading honest: `route` records
+how the protein earned its place in the specific set, so you can check
+whether the two routes tell the same story, and `tested_in` records which
+arm could reach it. Proteins neither arm could test are labelled
+**`not testable (no HL/NL information)`** rather than
+`no clear NL/HL difference` --- an absence of evidence, not evidence of
+absence.
+
+```{r combined-verdict}
+verdict_levels <- c("HL-enriched (quant)", "HL-gained (presence)", "HL-leaning (detection)",
+                    "NL-enriched (quant)", "NL-gained (presence)", "NL-leaning (detection)",
+                    "no clear NL/HL difference", "not testable (no HL/NL information)")
+
+combined <- specific %>%
+  select(Protein.Group, ensembl_peptide_id, Genes, Protein.Names,
+         any_of("Description"), route, qualifies_in) %>%
+  left_join(select(coverage, Protein.Group, tested_in, in_quant_matrix,
+                   n_quant_HL, n_quant_NL), by = "Protein.Group") %>%
+  left_join(select(pa, Protein.Group, det_HL, det_NL, detection_class, pattern,
+                   fisher_p, fisher_adj, pa_direction), by = "Protein.Group") %>%
+  left_join(select(de, Protein.Group, log2FC_HL_vs_NL, pvalue, adj_pvalue, direction),
+            by = "Protein.Group") %>%
+  mutate(tested_by_intensity = !is.na(adj_pvalue),
+         verdict = case_when(
+           tested_by_intensity & direction == "up in HL"   ~ "HL-enriched (quant)",
+           tested_by_intensity & direction == "down in HL" ~ "NL-enriched (quant)",
+           pa_direction == "more in HL"                    ~ "HL-gained (presence)",
+           pa_direction == "more in NL"                    ~ "NL-gained (presence)",
+           detection_class == "HL-only"                    ~ "HL-leaning (detection)",
+           detection_class == "NL-only"                    ~ "NL-leaning (detection)",
+           # separated from the line below on purpose: "no test was possible" is
+           # not the same statement as "we tested and found no difference"
+           tested_in == "neither"       ~ "not testable (no HL/NL information)",
+           TRUE                         ~ "no clear NL/HL difference")) %>%
+  arrange(factor(verdict, levels = verdict_levels), coalesce(adj_pvalue, fisher_adj))
+
+write_csv(combined, file.path(params$outdir, "YAP1C_NL_vs_HL_combined_verdict.csv"))
+
+cat("Verdict by route into the specific set:\n")
+print(table(verdict = factor(combined$verdict, levels = verdict_levels),
+            route   = combined$route))
+combined %>% filter(!verdict %in% c("no clear NL/HL difference",
+                                    "not testable (no HL/NL information)")) %>% head(30)
+```
+
+------------------------------------------------------------------------
+
+# Heatmaps
+
+All three heatmaps show **absolute log2 PG.MaxLFQ** (not z-scored) across
+the eight YAP1C runs, NL block beside HL block, so intensities can be
+compared directly. Cells that were never quantified stay **grey**, which is
+what makes on/off behaviour visible.
+
+## Condition-biased interactors
+
+Reproducible (>= `r params$min_reps`/4) in one treatment but not the other.
+
+```{r heatmap-biased, fig.height=7}
+biased <- filter(pa, pattern %in% c("HL-exclusive", "NL-exclusive",
+                                    "HL-biased", "NL-biased"))
+cat("Condition-biased interactors:", nrow(biased), "\n"); print(table(biased$pattern))
+
+lfq_heatmap(order_by_mean_lfq(biased$Protein.Group, log2mat),
+            mat = log2mat,
+            title = "Condition-biased specific interactors - log2 LFQ",
+            subtitle = sprintf(">= %d/4 replicates in one treatment only; rows ordered by mean log2 LFQ where detected, highest at the top; grey = not quantified",
+                               params$min_reps))
+```
+
+## Treatment-exclusive interactors
+
+The strict on/off cases: reproducible in one treatment, **never** seen in
+the other. One block is entirely grey by construction, so rows are grouped
+by class and ordered by mean intensity rather than by HL - NL.
+
+```{r heatmap-exclusive, fig.height=6}
+exclusive <- filter(pa, pattern %in% c("HL-exclusive", "NL-exclusive"))
+cat("Treatment-exclusive interactors:", nrow(exclusive), "\n")
+print(table(exclusive$pattern))
+
+# Each class kept as a block, and within a block the most abundant first.
+ex_pg <- c(order_by_mean_lfq(exclusive$Protein.Group[exclusive$pattern == "HL-exclusive"],
+                             log2mat),
+           order_by_mean_lfq(exclusive$Protein.Group[exclusive$pattern == "NL-exclusive"],
+                             log2mat))
+
+lfq_heatmap(ex_pg, mat = log2mat,
+            title = "Treatment-exclusive specific interactors - log2 LFQ",
+            subtitle = sprintf(">= %d/4 in one treatment, 0/4 in the other; HL-exclusive block on top",
+                               params$min_reps))
+```
+
+## Every specific interactor
+
+```{r heatmap-all, fig.height=11}
+lfq_heatmap(order_by_hl_minus_nl(rownames(log2mat), log2mat, hl_runs, nl_runs),
+            mat = log2mat,
+            title = "All specific YAP1C interactors - log2 LFQ, NL vs HL",
+            subtitle = "rows ordered by HL - NL mean log2 LFQ; grey = not quantified")
+```
+
+------------------------------------------------------------------------
+
+# GO term enrichment
+
+Which biological functions are over-represented among the specific YAP1C
+interactors --- and do the HL-specific and NL-specific proteins do
+different jobs?
+
+**The background matters more than the test.** The comparison set here is
+**every protein group identified in this experiment**, not every gene in
+the genome. A pull-down only sees abundant, extractable, MS-friendly
+proteins, so testing against the whole genome mostly rediscovers that fact
+and returns "ribosome", "chloroplast", "cytosol" no matter what the bait
+was. Against the detected background, a term is only enriched if it stands
+out among proteins the experiment could have seen.
+
+Annotations come from **`org.At.tair.db`**, the Bioconductor annotation
+package for Arabidopsis. It is keyed on TAIR loci, which is exactly what the
+protein groups map to, and it works offline once installed --- no web service
+to time out mid-knit. One locus is used per protein group (the first mapped
+accession). Annotations are then **propagated up the GO hierarchy** with
+`GO.db`: a protein annotated to *response to hydrogen peroxide* is by
+definition also annotated to *response to oxidative stress*, and without
+propagation those broader categories would be badly under-counted.
+
+```{r go-annotation}
+# GO annotations come from org.At.tair.db, the Bioconductor annotation package
+# for Arabidopsis. It is keyed on TAIR loci - exactly what the protein groups
+# map to - and works offline once installed, so there is no web service to fail.
+for (pkg in c("GO.db", "org.At.tair.db")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager", repos = "https://cloud.r-project.org")
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+
+# --- 1. protein group -> TAIR locus --------------------------------------
+# AT3G14630.2 -> AT3G14630. Groups whose ID fell back to a UniProt accession
+# have no locus and drop out here.
+pg2gene <- annot %>%
+  transmute(Protein.Group,
+            gene = toupper(sub("\\.\\d+$", "", sub(";.*$", "", ensembl_peptide_id)))) %>%
+  filter(grepl("^AT[1-5CM]G[0-9]{5}$", gene))
+
+cat(sprintf("Protein groups with a TAIR locus: %d of %d\n",
+            nrow(pg2gene), nrow(annot)))
+
+# --- 2. TAIR locus -> GO term --------------------------------------------
+# Only ask about loci the package recognises: select() errors outright if none
+# of the keys are valid, and warns confusingly if some are not.
+known_keys <- AnnotationDbi::keys(org.At.tair.db::org.At.tair.db, keytype = "TAIR")
+go_keys    <- intersect(unique(pg2gene$gene), known_keys)
+
+g2go <- if (length(go_keys)) {
+  suppressMessages(
+    AnnotationDbi::select(org.At.tair.db::org.At.tair.db, keys = go_keys,
+                          columns = "GO", keytype = "TAIR")) %>%
+    filter(!is.na(GO)) %>%
+    distinct(gene = TAIR, go_id = GO)
+} else {
+  tibble(gene = character(), go_id = character())
+}
+
+cat(sprintf("Loci recognised by org.At.tair.db: %d of %d\n",
+            length(go_keys), n_distinct(pg2gene$gene)))
+cat(sprintf("Direct gene-to-term annotations: %d\n", nrow(g2go)))
+
+# go_ok gates the chunks below, so a GO problem costs you this section and
+# nothing else - the rest of the report still knits.
+go_ok <- nrow(pg2gene) > 0 && nrow(g2go) > 0
+if (!go_ok) cat(
+  "\n!! GO section skipped. Check the counts above: if no protein group got a\n",
+  "   TAIR locus, the peptide-ID mapping upstream is what needs fixing; if loci\n",
+  "   were found but no annotations came back, reinstall org.At.tair.db.\n")
+```
+
+```{r go-propagate, eval = go_ok}
+# Propagate each annotation up the GO hierarchy: a protein annotated to
+# "response to hydrogen peroxide" also counts towards "response to oxidative
+# stress". Without this, broad categories are badly under-counted.
+ancestors <- c(as.list(GO.db::GOBPANCESTOR),
+               as.list(GO.db::GOMFANCESTOR),
+               as.list(GO.db::GOCCANCESTOR))
+per_gene <- lapply(split(g2go$go_id, g2go$gene), function(ids)
+  setdiff(unique(c(ids, unlist(ancestors[ids], use.names = FALSE))), c("all", NA)))
+
+# as.character() keeps both columns character even if a list comes back empty;
+# without it an empty result produces NULL columns and the lookup below fails
+# with "'keys' must be a character vector".
+go_prop <- tibble(gene  = toupper(as.character(rep(names(per_gene), lengths(per_gene)))),
+                  go_id = as.character(unlist(per_gene, use.names = FALSE)))
+
+go_info <- suppressMessages(
+  AnnotationDbi::select(GO.db::GO.db, keys = unique(go_prop$go_id),
+                        columns = c("TERM", "ONTOLOGY"), keytype = "GOID")) %>%
+  filter(!is.na(TERM))
+
+cat(sprintf("After propagation: %d genes, %d distinct GO terms\n",
+            n_distinct(go_prop$gene), n_distinct(go_prop$go_id)))
+```
+
+**The test.** For each GO term: of the *B* background genes, *b* carry the
+term; of the *Q* genes in the list being tested, *q* carry it. The
+hypergeometric p-value asks how surprising *q* is, and fold enrichment is
+`(q/Q) / (b/B)`. Terms are only tested if they cover at least 5 and at most
+2000 background genes (tiny terms are noise, enormous ones are
+uninformative) and if the list contributes at least 3 genes. p-values are
+BH-adjusted **within each list**.
+
+```{r go-enrichment, eval = go_ok}
+# The background is the genes that are BOTH measurable here and GO-annotated.
+universe   <- intersect(unique(pg2gene$gene), unique(go_prop$gene))
+go_bg      <- filter(go_prop, gene %in% universe)
+n_universe <- length(universe)
+
+cat(sprintf("Genes from protein groups: %d | genes with GO: %d | background overlap: %d\n",
+            n_distinct(pg2gene$gene), n_distinct(go_prop$gene), n_universe))
+if (!n_universe)
+  cat("!! The two ID sets do not overlap, so nothing can be tested. Examples:\n",
+      "   from protein groups:",
+      paste(head(unique(pg2gene$gene), 5), collapse = ", "), "\n",
+      "   from Ensembl GO    :",
+      paste(head(unique(go_prop$gene), 5), collapse = ", "), "\n",
+      "   If those are different kinds of identifier, the locus mapping in the\n",
+      "   chunk above is what needs fixing.\n")
+
+term_sizes <- go_bg %>%
+  group_by(go_id) %>% summarise(n_bg = n(), .groups = "drop") %>%
+  filter(n_bg >= 5, n_bg <= 2000)
+
+# Hypergeometric over-representation of one gene list against that background.
+# The empty case must carry the same columns as the full one: bind_rows() of
+# bare tibble()s gives a table with no columns at all, and the join below then
+# fails with "Join columns in `x` must be present in the data".
+empty_result <- tibble(go_id = character(), n_hit = integer(), n_bg = integer(),
+                       list = character(), n_query = integer(),
+                       fold_enrichment = double(), pvalue = double(),
+                       adj_pvalue = double())
+
+go_test <- function(genes, label) {
+  q_genes <- intersect(unique(genes), universe)
+  n_query <- length(q_genes)
+  if (!n_query || !nrow(term_sizes)) return(empty_result)
+  go_bg %>%
+    filter(gene %in% q_genes) %>%
+    group_by(go_id) %>% summarise(n_hit = n(), .groups = "drop") %>%
+    inner_join(term_sizes, by = "go_id") %>%
+    filter(n_hit >= 3) %>%
+    mutate(list = label, n_query = n_query,
+           fold_enrichment = (n_hit / n_query) / (n_bg / n_universe),
+           pvalue = phyper(n_hit - 1, n_bg, n_universe - n_bg, n_query,
+                           lower.tail = FALSE),
+           adj_pvalue = p.adjust(pvalue, "BH"))
+}
+
+# The whole broadened set, then split by how it behaves between treatments.
+gene_of <- function(pgs) pg2gene$gene[pg2gene$Protein.Group %in% pgs]
+lists <- list(
+  "All interactors" = gene_of(specific$Protein.Group),
+  "HL-specific"     = gene_of(pa$Protein.Group[pa$specificity == "HL-specific"]),
+  "NL-specific"     = gene_of(pa$Protein.Group[pa$specificity == "NL-specific"]),
+  "Both treatments" = gene_of(pa$Protein.Group[pa$specificity == "both treatments"]))
+
+go_res <- bind_rows(lapply(names(lists), function(l) go_test(lists[[l]], l))) %>%
+  left_join(go_info, by = c("go_id" = "GOID")) %>%
+  select(list, go_id, term = TERM, ontology = ONTOLOGY, n_hit, n_query, n_bg,
+         fold_enrichment, pvalue, adj_pvalue) %>%
+  arrange(list, adj_pvalue)
+
+write_csv(go_res, file.path(params$outdir, "YAP1C_GO_enrichment.csv"))
+
+if (!nrow(go_res))
+  cat("!! No GO term could be tested - see the diagnostics above.\n")
+cat("Background genes:", n_universe, "| terms tested:", nrow(term_sizes), "\n")
+cat("Genes per list:", paste(sprintf("%s = %d", names(lists),
+                                     vapply(lists, function(g)
+                                       length(intersect(unique(g), universe)),
+                                       integer(1))), collapse = "; "), "\n")
+cat(sprintf("Terms significant at adj.p < %.2g:\n", params$fdr))
+print(table(list = go_res$list, significant = go_res$adj_pvalue < params$fdr))
+
+go_res %>% filter(list == "All interactors", adj_pvalue < params$fdr) %>%
+  mutate(fold_enrichment = round(fold_enrichment, 2)) %>% head(25)
+```
+
+## GO heatmap
+
+Rows are the strongest terms (up to 8 per list, grouped by ontology);
+columns are the four lists. Colour is the BH-adjusted p-value on a
+`-log10` scale, **capped at 10** so a single astronomically significant
+term does not flatten everything else. The number in each cell is how many
+proteins from that list carry the term. A **blank** cell means the term was
+not testable for that list (fewer than 3 of its proteins carry it), which
+is not the same as "not enriched".
+
+```{r go-heatmap, fig.width=9, fig.height=9, eval = go_ok}
+top_terms <- go_res %>%
+  filter(adj_pvalue < params$fdr) %>%
+  group_by(list) %>% slice_min(adj_pvalue, n = 8, with_ties = FALSE) %>%
+  ungroup() %>% distinct(go_id) %>% pull(go_id)
+
+if (!length(top_terms)) {
+  cat("No GO term reached adj.p <", params$fdr, "in any list - no heatmap drawn.\n")
+} else {
+  hm <- go_res %>%
+    filter(go_id %in% top_terms) %>%
+    mutate(row_label = sprintf("[%s] %s", ontology, str_trunc(term, 55)),
+           list  = factor(list, levels = names(lists)),
+           score = pmin(-log10(adj_pvalue), 10))
+
+  row_order <- hm %>%
+    group_by(row_label) %>%
+    summarise(ontology = first(ontology), best = min(adj_pvalue), .groups = "drop") %>%
+    arrange(ontology, best) %>% pull(row_label)
+
+  ggplot(mutate(hm, row_label = factor(row_label, levels = rev(row_order))),
+         aes(list, row_label, fill = score)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = n_hit), size = 2.8, colour = "grey15") +
+    scale_fill_gradient(low = "#fdecea", high = "#922b21",
+                        name = "-log10\nadj. p") +
+    labs(title = "GO terms enriched among the specific YAP1C interactors",
+         subtitle = sprintf("background = %d detected proteins; cell number = proteins from that list in the term",
+                            n_universe),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          axis.text.y = element_text(size = 7),
+          panel.grid = element_blank())
+}
+```
+
+------------------------------------------------------------------------
+
+# Files written
+
+```{r outputs}
+list.files(params$outdir, full.names = TRUE)
+```
+
+**The two lists to work from**
+
+- `YAP1C_specific_interactors_broadened.csv` --- the specific interactor
+  set (route A + route B), with a `route` column. This is what the HL vs NL
+  analysis was run on.
+- `YAP1C_NL_vs_HL_combined_verdict.csv` --- one row per specific
+  interactor with its final HL vs NL verdict, both tests side by side.
+- `YAP1C_NL_vs_HL_test_coverage.csv` --- which arm reached each protein
+  (`tested_in`), with the identification and quantification counts behind
+  that decision.
+- `YAP1C_NL_vs_HL_untested.csv` --- the proteins neither arm could test,
+  each with a `why_not_tested` explanation. May well be empty; the notebook
+  says so if it is.
+
+**Supporting tables**
+
+- `unique_YAP1C_interactors.csv` --- route A only (absent from YAP1A).
+- `YAP1C_enriched_significant.csv` --- route B only (enriched over YAP1A).
+- `YAP1A_background_list.csv` --- protein groups called background.
+- `YAP1C_all_interactors.csv` --- interactors before any specificity filter.
+- `YAP1C_vs_YAP1A_limma.csv` --- the full probe-comparison test.
+- `YAP1C_NL_vs_HL_differential.csv` --- arm 1, intensity (limma).
+- `YAP1C_NL_vs_HL_presence_absence.csv` --- arm 2, detection (Fisher).
+- `YAP1C_condition_exclusive.csv` --- the proteins arm 1 could not test.
+- `YAP1C_GO_enrichment.csv` --- every GO term tested, per list, with
+  fold enrichment and adjusted p-value.
+- `uniprot_to_ensembl_peptide.csv` --- cached Ensembl ID lookup. Delete it to
+  force a fresh query.
+
+```{r session}
+sessionInfo()
+```
